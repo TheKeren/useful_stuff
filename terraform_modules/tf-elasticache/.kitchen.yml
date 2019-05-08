@@ -1,0 +1,23 @@
+---
+driver:
+  name: terraform
+  backend_configurations:
+    bucket : beamly-terraform-kitchen-state
+    key    : beamly-elasticache
+    region : eu-central-1
+  root_module_directory: spec/fixtures/
+
+provisioner:
+  name: terraform
+
+platforms:
+  - name: aws
+
+verifier:
+  name: awspec
+
+suites:
+  - name: beamly-elasticache
+    verifier:
+      patterns:
+        - spec/elasticache_spec.rb
