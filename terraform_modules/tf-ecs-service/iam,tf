@@ -1,0 +1,135 @@
+locals {
+  extra_policy_count = "${length(var.extra_policy_actions) > 0 ? 1 : 0}"
+}
+
+## ECS Service Role
+data "aws_iam_policy_document" "ecs-sts" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      identifiers = ["ecs.amazonaws.com"]
+      type        = "Service"
+    }
+  }
+}
+
+resource "aws_iam_role" "ecs-servicerole" {
+  assume_role_policy    = "${data.aws_iam_policy_document.ecs-sts.json}"
+  name                  = "${local.branded_app_name}-ecs-servicerole"
+  force_detach_policies = true
+}
+
+resource "aws_iam_role_policy_attachment" "ecs-servicerole_policy_attachment" {
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceRole"
+  role       = "${aws_iam_role.ecs-servicerole.name}"
+}
+
+## Ecs Service Task Definition optional Service Role 
+
+data "aws_iam_policy_document" "task-definition-policy-document" {
+  count = "${local.extra_policy_count}"
+
+  statement {
+    effect    = "Allow"
+    actions   = ["${var.extra_policy_actions}"]
+    resources = ["${var.extra_policy_resources}"]
+  }
+
+  statement {
+    effect = "Allow"
+
+    actions = [
+      "ecr:GetAuthorizationToken",
+      "ecr:BatchCheckLayerAvailability",
+      "ecr:GetDownloadUrlForLayer",
+      "ecr:BatchGetImage",
+      "logs:CreateLogStream",
+      "logs:PutLogEvents",
+    ]
+
+    resources = [
+      "*",
+    ]
+  }
+}
+
+resource "aws_iam_policy" "task-definition-policy" {
+  count  = "${local.extra_policy_count}"
+  name   = "${local.branded_app_name}-task-definition-policy"
+  policy = "${data.aws_iam_policy_document.task-definition-policy-document.json}"
+}
+
+data "aws_iam_policy_document" "task-definition-sts" {
+  count = "${local.extra_policy_count}"
+
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      identifiers = ["ecs-tasks.amazonaws.com"]
+      type        = "Service"
+    }
+  }
+}
+
+resource "aws_iam_role" "task-definition-servicerole" {
+  count                 = "${local.extra_policy_count}"
+  assume_role_policy    = "${data.aws_iam_policy_document.task-definition-sts.json}"
+  name                  = "${local.branded_app_name}-task-role"
+  force_detach_policies = true
+}
+
+resource "aws_iam_role_policy_attachment" "task-definition-policy-attachment" {
+  count      = "${local.extra_policy_count}"
+  policy_arn = "${aws_iam_policy.task-definition-policy.arn}"
+  role       = "${aws_iam_role.task-definition-servicerole.name}"
+}
+
+## ASG Service Role
+
+data "aws_iam_policy_document" "ast-sts" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      identifiers = ["application-autoscaling.amazonaws.com"]
+      type        = "Service"
+    }
+  }
+}
+
+resource "aws_iam_role" "app-ast-servicerole" {
+  assume_role_policy    = "${data.aws_iam_policy_document.ast-sts.json}"
+  name                  = "${local.branded_app_name}-ecs-servicerole-ast"
+  force_detach_policies = true
+}
+
+data "aws_iam_policy_document" "servicerole-ast" {
+  statement {
+    effect = "Allow"
+
+    actions = [
+      "ecs:UpdateService",
+      "ecs:DescribeServices",
+      "application-autoscaling:*",
+      "cloudwatch:DescribeAlarms",
+      "cloudwatch:DescribeAlarms",
+      "cloudwatch:PutMetricAlarm",
+    ]
+
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_policy" "app-ast-servicerole-policy" {
+  policy = "${data.aws_iam_policy_document.servicerole-ast.json}"
+}
+
+resource "aws_iam_role_policy_attachment" "app-servicerole-ast" {
+  policy_arn = "${aws_iam_policy.app-ast-servicerole-policy.arn}"
+  role       = "${aws_iam_role.app-ast-servicerole.name}"
+}
