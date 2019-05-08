@@ -1,0 +1,448 @@
+locals {
+  // Used to figure out container names from the docker repositpry to set links
+  images_string   = "${join(",", var.repository-urls)}"
+  regex           = "/(^[0-9a-z-.]*/)|(,[0-9a-z-.]*/)/"
+  replace         = ","
+  b_regex         = "/(^,)|([A-Za-z0-9]*-)|(-[A-Za-z0-9]*-)/"
+  b_replace       = ""
+  container_names = "${split(",", replace(replace(local.images_string, local.regex, local.replace), local.b_regex, local.b_replace))}"
+
+  //
+  container_port = {
+    "container_port" = "${var.frontend_container_port}"
+  }
+
+  standard_environment_variables = {
+    "BRAND"           = "${var.brand}"
+    "APP"             = "${var.app_name}"
+    "APP_ENVIRONMENT" = "${var.environment}"
+  }
+
+  ssm_db_credentials = {
+    "MYSQL_DATABASE"      = "${element(concat(data.aws_ssm_parameter.db_name.*.value, list("")), 0)}"
+    "MYSQL_HOST"          = "${element(concat(data.aws_ssm_parameter.database_address.*.value, list("")), 0)}"
+    "MYSQL_USER"          = "${element(concat(data.aws_ssm_parameter.database_username.*.value, list("")), 0)}"
+    "MYSQL_PASSWORD"      = "${element(concat(data.aws_ssm_parameter.database_password.*.value, list("")), 0)}"
+    "MYSQL_ROOT_PASSWORD" = "${element(concat(data.aws_ssm_parameter.database_password.*.value, list("")), 0)}"
+  }
+
+  ssm_redis_frontend_credentials = {
+    "REDIS_URL" = "${element(concat(data.aws_ssm_parameter.redis_url_frontend.*.value, list("")), 0)}"
+  }
+
+  ssm_redis_backend_credentials = {
+    "REDIS_URL" = "${element(concat(data.aws_ssm_parameter.redis_url_backend.*.value, list("")), 0)}"
+  }
+
+  frontend_environment_single_container = "${merge(local.standard_environment_variables, var.frontend_environment, local.ssm_redis_frontend_credentials, local.ssm_db_credentials)}"
+  frontend_environment_multi_container  = "${merge(local.standard_environment_variables, var.frontend_environment, local.ssm_redis_frontend_credentials)}"
+  backend_environment                   = "${merge(local.standard_environment_variables, local.ssm_db_credentials, var.db_environment, var.backend_environment, local.ssm_redis_backend_credentials)}"
+
+  //
+  logging_options = {
+    "awslogs-group"  = "${module.logs.log_group_name}"
+    "awslogs-region" = "${var.region}"
+  }
+}
+
+resource "null_resource" "compute_vars" {
+  count = "${length(var.repository-urls)}"
+
+  triggers {
+    is_frontend    = "${var.frontend_container_name == replace(var.repository-urls[count.index], "/^.*-([a-zA-Z0-9]*$)/", "$1") ? true : false }"
+    container_name = "${replace(var.repository-urls[count.index], "/^.*-([a-zA-Z0-9]*$)/", "$1")}"
+    links          = "${replace(join(",", local.container_names), replace(var.repository-urls[count.index], "/^.*-([a-zA-Z0-9]*$)/", "$1"), "")}"
+  }
+}
+
+# This is done because boolean values cross the module boundary as 0 and 1,
+# So we need to cheaply cast it back to the literal of `false` and `true`
+
+data "template_file" "essential" {
+  template = "$${jsonencode("essential")}: $${val ? true : false}"
+
+  vars {
+    val = "${var.essential != "" ? var.essential : "false"}"
+  }
+}
+
+# Set up the port mappings
+# Done in this way because Terraform is "helpful" when it comes to rendering
+# numbers via jsonencode, and treats them as strings, which fails the struct
+# validation later
+
+// Since we can't set value of list based on a conditional we have to create two port mappings template snippets.
+
+data "template_file" "_port_mapping_default" {
+  template = <<JSON
+{ $${join(",",
+  compact(
+    list(
+    hostPort == "" ? "" : "$${jsonencode("hostPort")}: $${hostPort}",
+    "$${jsonencode("containerPort")}: $${containerPort}",
+    protocol == "" ? "" : "$${jsonencode("protocol")}: $${jsonencode(protocol)}"
+    )
+  )
+)} }
+JSON
+
+  vars {
+    hostPort = "${ lookup(local.container_port, "host_port", "") }"
+
+    # So that TF will throw an error - this is a required field
+    containerPort = "${ lookup(local.container_port, "container_port") }"
+    protocol      = "${ lookup(local.container_port, "protocol", "") }"
+  }
+}
+
+data "template_file" "_port_mapping" {
+  count = "${length(var.frontend_port_mappings)}"
+
+  template = <<JSON
+{$${join(",",
+  compact(
+    list(
+    hostPort == "" ? "" : "$${jsonencode("hostPort")}: $${hostPort}",
+    "$${jsonencode("containerPort")}: $${containerPort}",
+    protocol == "" ? "" : "$${jsonencode("protocol")}: $${jsonencode(protocol)}"
+    )
+  )
+)}}
+JSON
+
+  vars {
+    hostPort = "${ lookup(var.frontend_port_mappings[count.index], "host_port", "") }"
+
+    # So that TF will throw an error - this is a required field
+    containerPort = "${ lookup(var.frontend_port_mappings[count.index], "container_port") }"
+    protocol      = "${ lookup(var.frontend_port_mappings[count.index], "protocol", "") }"
+  }
+}
+
+# Wrap the rendered port mappings in a JSON array
+
+data "template_file" "_port_mappings" {
+  template = <<JSON
+"portMappings": [$${ports}]
+JSON
+
+  vars {
+    ports = "${length(var.frontend_port_mappings) > 0 ?
+                "${join(",",data.template_file._port_mapping.*.rendered)}" :
+                "${data.template_file._port_mapping_default.rendered}"
+            }"
+  }
+}
+
+## SSM secrets
+
+# Regex will match everything until (inclusing) the last / or -
+locals {
+  ssm_secret_used = "${length(var.ssm_keys) > 0 ? 1 : 0}"
+  ssm_prefix      = "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter"
+}
+
+# Secrets
+
+data "template_file" "_ssm_secrets" {
+  count = "${length(var.ssm_keys)}"
+
+  template = <<JSON
+{
+  "name": $${name},
+  "valueFrom":$${value}
+}
+JSON
+
+  vars {
+    name  = "${jsonencode(element(keys(var.ssm_keys[count.index]), 0))}"
+    value = "${jsonencode("${local.ssm_prefix}${element(values(var.ssm_keys[count.index]), 0)}")}"
+  }
+}
+
+data "template_file" "_ssm_secrets_wrapper_list" {
+  template = <<JSON
+  "secrets": [$${secrets}]
+JSON
+
+  vars {
+    secrets = "${join(",",data.template_file._ssm_secrets.*.rendered)}"
+  }
+}
+
+## Env vars
+# Constructs the environment K/V from a map.
+# Prevents an envar from being declared more than once, as is sensible
+
+data "template_file" "_environment_keys_frontend_multi_container" {
+  count = "${length(keys(local.frontend_environment_multi_container))}"
+
+  template = <<JSON
+{
+  "name": $${name},
+  "value":$${value}
+}
+JSON
+
+  vars {
+    name  = "${jsonencode(element(keys(local.frontend_environment_multi_container), count.index))}"
+    value = "${jsonencode(element(values(local.frontend_environment_multi_container), count.index))}"
+  }
+}
+
+data "template_file" "_environment_keys_frontend_single_container" {
+  count = "${length(keys(local.frontend_environment_single_container))}"
+
+  template = <<JSON
+{
+  "name": $${name},
+  "value":$${value}
+}
+JSON
+
+  vars {
+    name  = "${jsonencode(element(keys(local.frontend_environment_single_container), count.index))}"
+    value = "${jsonencode(element(values(local.frontend_environment_single_container), count.index))}"
+  }
+}
+
+data "template_file" "_environment_list_frontend_single_container" {
+  template = <<JSON
+  "environment": [$${environment}]
+JSON
+
+  vars {
+    environment = "${join(",",data.template_file._environment_keys_frontend_single_container.*.rendered)}"
+  }
+}
+
+data "template_file" "_environment_list_frontend_multi_container" {
+  template = <<JSON
+  "environment": [$${environment}]
+JSON
+
+  vars {
+    environment = "${join(",",data.template_file._environment_keys_frontend_multi_container.*.rendered)}"
+  }
+}
+
+locals {
+  frontenv_environment_variables_final = "${length(var.repository-urls) == 1? data.template_file._environment_list_frontend_single_container.rendered :
+                                                                               data.template_file._environment_list_frontend_multi_container.rendered}"
+}
+
+# Constructs the environment K/V from a map.
+# Prevents an envar from being declared more than once, as is sensible
+
+data "template_file" "_environment_keys_backend" {
+  count = "${length(keys(local.backend_environment))}"
+
+  template = <<JSON
+{
+  "name": $${name},
+  "value":$${value}
+}
+JSON
+
+  vars {
+    name  = "${jsonencode(element(keys(local.backend_environment), count.index))}"
+    value = "${jsonencode(element(values(local.backend_environment), count.index))}"
+  }
+}
+
+data "template_file" "_environment_list_backend" {
+  template = <<JSON
+  "environment": [$${environment}]
+JSON
+
+  vars {
+    environment = "${join(",",data.template_file._environment_keys_backend.*.rendered)}"
+  }
+}
+
+# Done this way because of module boundaries casting booleans to 0 and 1
+
+data "template_file" "_mount_keys" {
+  count = "${length(var.mount_points)}"
+
+  template = <<JSON
+{$${join(",",
+  compact(
+    list(
+      "$${jsonencode("sourceVolume")}: $${jsonencode(sourceVolume)}",
+      "$${jsonencode("containerPath")}: $${jsonencode(containerPath)}",
+      read_only == "" ? "" : "$${jsonencode("readOnly")} : $${read_only == 1 ? true : false}"
+    )
+  )
+)}}
+JSON
+
+  vars {
+    sourceVolume  = "${lookup(var.mount_points[count.index], "source_volume")}"
+    containerPath = "${lookup(var.mount_points[count.index], "container_path")}"
+    read_only     = "${lookup(var.mount_points[count.index], "read_only", "")}"
+  }
+}
+
+# create the mount list via concatenating the two previous steps
+
+data "template_file" "_mount_list" {
+  template = <<JSON
+"mountPoints": [$${mounts}]
+JSON
+
+  vars {
+    mounts = "${join(",",data.template_file._mount_keys.*.rendered)}"
+  }
+}
+
+# create the volume_from elements
+
+data "template_file" "_volumes_from_keys" {
+  count = "${length(var.volumes_from)}"
+
+  template = <<JSON
+{$${join(",",
+  compact(
+    list(
+      "$${jsonencode("sourceContainer")}: $${jsonencode(sourceContainer)}",
+      read_only == "" ? "" : "$${jsonencode("readOnly")} : $${read_only == 1 ? true : false}"
+    )
+  )
+)}}
+JSON
+
+  vars {
+    sourceContainer = "${lookup(var.volumes_from[count.index], "source_container")}"
+    read_only       = "${lookup(var.volumes_from[count.index], "read_only", "")}"
+  }
+}
+
+# concatenate a list out of the rendered dicts
+
+data "template_file" "_volumes_from_list" {
+  # This should construct a normal list
+  template = <<JSON
+"volumesFrom": [$${volumes}]
+JSON
+
+  vars {
+    volumes = "${join(",",data.template_file._volumes_from_keys.*.rendered)}"
+  }
+}
+
+data "template_file" "_log_configuration_driver" {
+  template = "$${driver}"
+
+  vars {
+    driver = "${ length(var.logging_driver) > 0
+      ? "${jsonencode("logDriver")}: ${ jsonencode(var.logging_driver) }"
+      : ""
+      }"
+  }
+}
+
+data "template_file" "_log_configuration_options" {
+  count = "${length(var.repository-urls)}"
+
+  # Will become an empty string
+  template = "${jsonencode("options")}: ${jsonencode(merge(local.logging_options, map("awslogs-stream-prefix",
+                "ecs/${local.container_names[count.index]}")))}"
+}
+
+data "template_file" "_log_configuration" {
+  count = "${length(var.repository-urls)}"
+
+  template = "{$${configuration}}"
+
+  vars {
+    configuration = "${join(",",
+        compact(
+          list(
+            data.template_file._log_configuration_driver.rendered,
+            data.template_file._log_configuration_options.*.rendered[count.index]
+          )
+        )
+    )}"
+  }
+}
+
+# Creates an Entrypoint
+
+data "template_file" "_entrypoint" {
+  template = "$${entrypoint}"
+
+  vars {
+    entrypoint = "${ length(var.entrypoint) > 0
+      ? "${jsonencode("entryPoint")}: ${ jsonencode(var.entrypoint) }"
+      : ""
+      }"
+  }
+}
+
+# Creates a command 
+
+data "template_file" "_command" {
+  template = "$${command}"
+
+  vars {
+    command = "${ length(var.command) > 0
+      ? "${jsonencode("command")}: ${ jsonencode(var.command) }"
+      : ""
+      }"
+  }
+}
+
+# Builds the final json map. Will create one map per container.
+
+data "template_file" "_final" {
+  count = "${length(var.repository-urls)}"
+
+  template = <<JSON
+  {
+    $${val}
+  }
+JSON
+
+  vars {
+    val = "${join(",",
+      compact(
+        list(
+          "${jsonencode("name")}: ${jsonencode(local.container_names[count.index])}",
+          "${jsonencode("image")}: ${jsonencode("${var.repository-urls[count.index]}:${var.ecs_tag}")}",
+          "${var.td_cpu != "" ? "${jsonencode("cpu")}: ${var.td_cpu}" : "" }",
+          "${var.td_memory != "" ? "${jsonencode("memoryReservation")}: ${var.td_memory}" : "" }",
+          "${var.essential != "" ? data.template_file.essential.rendered : ""}",
+          "${null_resource.compute_vars.*.triggers.is_frontend[count.index]
+            ? "${jsonencode("links")}: ${jsonencode(compact(split(",", null_resource.compute_vars.*.triggers.links[count.index])))}" : ""}",
+          "${null_resource.compute_vars.*.triggers.is_frontend[count.index] ? data.template_file._port_mappings.rendered : ""}",
+          "${null_resource.compute_vars.*.triggers.is_frontend[count.index]
+            ? local.frontenv_environment_variables_final : data.template_file._environment_list_backend.rendered}",
+          "${length(var.ssm_keys) > 0 ? data.template_file._ssm_secrets_wrapper_list.rendered : ""}",
+          "${length(var.mount_points) > 0 ? data.template_file._mount_list.rendered : "" }",
+          "${length(var.volumes_from) > 0 ? data.template_file._volumes_from_list.rendered : "" }",
+          "${length(var.logging_driver) > 0
+            ? "${jsonencode("logconfiguration")}: ${data.template_file._log_configuration.*.rendered[count.index]}"
+            : ""
+            }",
+          "${data.template_file._entrypoint.rendered}",
+          "${data.template_file._command.rendered}",
+          )
+        )
+      )}"
+  }
+}
+
+# warpss the rendered maps in a list, creates the final file.
+
+data "template_file" "td_wrapper" {
+  template = <<JSON
+[
+$${_final_output_list}
+]
+JSON
+
+  vars {
+    _final_output_list = "${join(",\n", data.template_file._final.*.rendered)}"
+  }
+}
