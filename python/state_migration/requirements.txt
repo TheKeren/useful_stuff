@@ -14,7 +14,7 @@ chardet==3.0.4
 checkbox-support==0.22
 command-not-found==0.3
 cookies==2.2.1
-cryptography==2.3.1
+cryptography==3.2
 cupshelpers==1.0
 defer==1.0.6
 defusedxml==0.5.0
