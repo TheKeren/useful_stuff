@@ -59,7 +59,7 @@ onelogin-aws-cli==0.1.15
 padme==1.1.1
 pbr==5.1.0
 pexpect==4.2.1
-Pillow==5.1.0
+Pillow==8.2.0
 plainbox==0.25
 progressbar==2.3
 protobuf==3.0.0
