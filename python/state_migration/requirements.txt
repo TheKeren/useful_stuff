@@ -84,7 +84,7 @@ python-jose==2.0.2
 pytz==2018.7
 pyxdg==0.25
 PyYAML==3.13
-reportlab==3.4.0
+reportlab==3.5.55
 requests==2.20.0
 requests-unixsocket==0.1.5
 responses==0.10.2
